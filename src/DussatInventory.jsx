@@ -263,7 +263,7 @@ function AddForm({ onCancel, onSave }) {
             value={location}
             onChange={(e) => setLocation(e.target.value)}
             className="w-full border rounded-lg p-3"
-            placeholder="A3 / Rack 2"
+            placeholder="C3 / Rack 2"
           />
         </div>
         <div>
