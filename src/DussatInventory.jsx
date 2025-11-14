@@ -1,93 +1,127 @@
 import React, { useEffect, useState } from "react";
+import {
+  db,
+  itemsCollection,
+  addDoc,
+  deleteDoc,
+  doc,
+  onSnapshot,
+  query,
+  orderBy,
+  serverTimestamp,
+  updateDoc,
+} from "./firebase";
 
-// Small helper to persist to localStorage
-const STORAGE_KEY = "dussat_inventory_v1";
-
-function uid() {
-  return Math.random().toString(36).slice(2, 9);
+// small CSV exporter
+function downloadCSV(items) {
+  const header = ["id,name,description,location,quantity,addedAt"];
+  const rows = items.map((it) =>
+    [it.id, it.name, it.description, it.location, it.quantity, it.addedAt]
+      .map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`)
+      .join(",")
+  );
+  const csv = [header, ...rows].join("\n");
+  const blob = new Blob([csv], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "dussat_inventory_export.csv";
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 export default function DussatInventory() {
   const [view, setView] = useState("home"); // home | add | search
   const [items, setItems] = useState([]);
 
-  // Load from localStorage on mount
+  // realtime listener from Firestore
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) setItems(JSON.parse(raw));
-    } catch (e) {
-      console.warn("Failed to load inventory", e);
-    }
+    // query to order by created time
+    const q = query(itemsCollection, orderBy("addedAt", "desc"));
+    const unsub = onSnapshot(
+      q,
+      (snapshot) => {
+        const out = snapshot.docs.map((d) => {
+          const data = d.data();
+          return {
+            id: d.id,
+            name: data.name,
+            description: data.description,
+            location: data.location,
+            quantity: data.quantity,
+            addedAt:
+              data.addedAt?.toDate?.()?.toISOString?.() ?? data.addedAt ?? "",
+          };
+        });
+        setItems(out);
+      },
+      (err) => {
+        console.error("Firestore onSnapshot error", err);
+      }
+    );
+
+    return () => unsub();
   }, []);
 
-  // Save when items change
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
-  }, [items]);
-
-  // Add item helper
-  function addItem(obj) {
-    setItems((s) => [
-      { ...obj, id: uid(), addedAt: new Date().toISOString() },
-      ...s,
-    ]);
-    setView("search");
-  }
-
-  // Delete helper
-  function deleteItem(id) {
-    if (!confirm("Delete this item?")) return;
-    setItems((s) => s.filter((i) => i.id !== id));
-  }
-
-  // Export CSV
-  function exportCSV() {
-    const header = ["id,name,description,location,quantity,addedAt"].join("\n");
-    const rows = items
-      .map((it) =>
-        [it.id, it.name, it.description, it.location, it.quantity, it.addedAt]
-          .map((v) => `"${String(v || "").replace(/"/g, '""')}"`)
-          .join(",")
-      )
-      .join("\n");
-    const csv = [header, rows].filter(Boolean).join("\n");
-    const blob = new Blob([csv], { type: "text/csv" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "dussat_inventory_export.csv";
-    a.click();
-    URL.revokeObjectURL(url);
-  }
-
-  // Import CSV (very small parser)
-  function importCSV(file) {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const txt = reader.result;
-      const lines = txt.split(/\r?\n/).filter(Boolean);
-      if (!lines.length) return;
-      // naive parse assuming header present
-      const data = lines.slice(1).map((ln) => {
-        // split on commas outside quotes (very naive); this app is for small imports
-        const cols =
-          ln
-            .match(/(".*?"|[^,]+)(?=,|$)/g)
-            ?.map((c) => c.replace(/^"|"$/g, "").replace(/""/g, '"')) || [];
-        return {
-          id: cols[0] || uid(),
-          name: cols[1] || "",
-          description: cols[2] || "",
-          location: cols[3] || "",
-          quantity: Number(cols[4] || 1),
-          addedAt: cols[5] || new Date().toISOString(),
-        };
-      });
-      setItems((s) => [...data, ...s]);
-      setView("search");
+  // Add item using Firestore
+  async function addItem(obj) {
+    const payload = {
+      name: obj.name,
+      description: obj.description,
+      location: obj.location,
+      quantity: Number(obj.quantity || 1),
+      addedAt: serverTimestamp(),
     };
-    reader.readAsText(file);
+    try {
+      await addDoc(itemsCollection, payload);
+      setView("search");
+    } catch (e) {
+      console.error("Failed to add item", e);
+      alert("Failed to add item: " + e.message);
+    }
+  }
+
+  // delete helper
+  async function handleDelete(id) {
+    if (!confirm("Delete this item?")) return;
+    try {
+      await deleteDoc(doc(db, "items", id));
+    } catch (e) {
+      console.error("Delete failed", e);
+      alert("Delete failed: " + e.message);
+    }
+  }
+
+  // export CSV
+  function exportCSV() {
+    downloadCSV(items);
+  }
+
+  // import CSV - still works client-side: parse then add via Firestore
+  async function importCSV(file) {
+    const txt = await file.text();
+    const lines = txt.split(/\r?\n/).filter(Boolean);
+    if (lines.length <= 1) return;
+    const rows = lines.slice(1);
+    // naive parse (CSV with quotes)
+    for (const ln of rows) {
+      const cols =
+        ln
+          .match(/(\".*?\"|[^,]+)(?=,|$)/g)
+          ?.map((c) => c.replace(/^"|"$/g, "").replace(/""/g, '"')) || [];
+      const payload = {
+        name: cols[1] || "",
+        description: cols[2] || "",
+        location: cols[3] || "",
+        quantity: Number(cols[4] || 1),
+        addedAt: serverTimestamp(),
+      };
+      try {
+        await addDoc(itemsCollection, payload);
+      } catch (e) {
+        console.error("Import add failed", e);
+      }
+    }
   }
 
   return (
@@ -139,7 +173,7 @@ export default function DussatInventory() {
             <SearchPanel
               items={items}
               onBack={() => setView("home")}
-              onDelete={deleteItem}
+              onDelete={handleDelete}
               onExport={exportCSV}
               onImport={importCSV}
             />
@@ -192,7 +226,6 @@ function AddForm({ onCancel, onSave }) {
       location: location.trim(),
       quantity: Number(quantity || 1),
     });
-    // clear
     setName("");
     setDescription("");
     setLocation("");
@@ -283,13 +316,10 @@ function SearchPanel({ items, onBack, onDelete, onExport, onImport }) {
 
   function handleImportChange(e) {
     const f = e.target.files?.[0];
-    if (f) importFile(f);
+    if (f) {
+      onImport(f);
+    }
     e.target.value = "";
-  }
-
-  function importFile(f) {
-    // bubble up
-    if (typeof onImport === "function") onImport(f);
   }
 
   return (
@@ -372,7 +402,8 @@ function SearchPanel({ items, onBack, onDelete, onExport, onImport }) {
                 </div>
                 <div className="flex flex-col items-end gap-2">
                   <div className="text-xs text-gray-400">
-                    Added: {new Date(it.addedAt).toLocaleString()}
+                    Added:{" "}
+                    {it.addedAt ? new Date(it.addedAt).toLocaleString() : "-"}
                   </div>
                   <div className="flex gap-2">
                     <button
